@@ -1,4 +1,5 @@
 import streamlit as st
+import base64
 import io
 import os
 from google.cloud import speech
@@ -6,46 +7,26 @@ from google.cloud import speech
 # Set page config for wider layout
 st.set_page_config(layout="wide")
 
-def transcribe_streaming(audio_stream):
-    """Streams audio from the microphone and transcribes it using Google Cloud Speech-to-Text."""
-
+def transcribe_audio(audio_bytes):
+    """Transcribes audio using Google Cloud Speech-to-Text."""
     client = speech.SpeechClient()
-
+    audio = speech.RecognitionAudio(content=audio_bytes)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",  # Change language as needed
-        model="default",  # or "latest_long" for better accuracy but higher latency
+        sample_rate_hertz=44100,  # Important: Match recording sample rate
+        language_code="en-US",
     )
-    streaming_config = speech.StreamingRecognitionConfig(config=config, interim_results=True)
+    try:
+        response = client.recognize(config=config, audio=audio)
+        transcript = ""
+        for result in response.results:
+            transcript += result.alternatives[0].transcript + " "
+        return transcript.strip()
+    except Exception as e:
+        st.error(f"Transcription error: {e}")
+        return None
 
-    def generator(audio_chunks):
-        for chunk in audio_chunks:
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-
-    requests = generator(audio_stream)
-
-    responses = client.streaming_recognize(config=streaming_config, requests=requests)
-
-    transcript = ""
-    for response in responses:
-        if not response.results:
-            continue
-
-        result = response.results[0]
-        if not result.alternatives:
-            continue
-
-        transcript_chunk = result.alternatives[0].transcript
-        if result.is_final:
-            transcript += transcript_chunk + " "
-            yield transcript
-            transcript = ""
-        else:
-            yield transcript + transcript_chunk + " (Interim)"
-
-
-st.title("Real-time Speech to Text with Streamlit and Google Cloud")
+st.title("WebRTC Audio Recorder with Streamlit and Google Cloud Speech-to-Text")
 
 # Access credentials from secrets.toml and set environment variable
 try:
@@ -55,32 +36,64 @@ try:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google_credentials.json"
 except KeyError:
     st.error("Google Cloud credentials not found in secrets.toml. Please configure.")
-    st.stop() # Stop execution if credentials are not found
+    st.stop()
 
-# Audio recording
-audio_bytes = st.audio(sample_rate=16000, format="audio/wav")
+# JavaScript for recording
+js_code = """
+<script>
+const startRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    const mediaRecorder = new MediaRecorder(stream);
+    const audioChunks = [];
 
-if audio_bytes:
+    mediaRecorder.addEventListener("dataavailable", event => {
+        audioChunks.push(event.data);
+    });
+
+    mediaRecorder.addEventListener("stop", async () => {
+        const audioBlob = new Blob(audioChunks, { type: "audio/wav" }); // Important: use wav
+        const base64 = await blobToBase64(audioBlob);
+        Streamlit.setComponentValue(base64);
+    });
+
+    mediaRecorder.start();
+    setTimeout(() => mediaRecorder.stop(), 5000); // Stop after 5 seconds (adjust as needed)
+};
+
+const blobToBase64 = blob => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+});
+
+const btn = document.createElement('button');
+btn.innerHTML = 'Record 5 Seconds';
+btn.onclick = startRecording;
+document.body.appendChild(btn);
+</script>
+"""
+
+st.components.v1.html(js_code)
+
+# Get the audio data from the frontend
+audio_base64 = st.session_state.get("component_value", None)
+
+if audio_base64:
     try:
-        audio_stream = io.BytesIO(audio_bytes)
-        transcription_generator = transcribe_streaming(iter(lambda: audio_stream.read(4096), b''))
+        audio_bytes = base64.b64decode(audio_base64.split(",")[1]) # Split to remove data url part
+        transcript = transcribe_audio(audio_bytes)
 
-        st.subheader("Transcription:") # Use a subheader
-        transcription_placeholder = st.empty()  # Placeholder for dynamic updates
+        if transcript:
+            st.write("Transcription:")
+            st.write(transcript)
 
-        for transcript in transcription_generator:
-            transcription_placeholder.write(transcript)
-
-        # Clean up the temporary credentials file
-        os.remove("google_credentials.json")
-
+        os.remove("google_credentials.json") #Cleanup
     except Exception as e:
-        st.error(f"An error occurred: {e}")
-        st.write("Please ensure your microphone is working and the audio format is correct (raw PCM, 16kHz). Check Google Cloud configuration.")
+        st.error(f"Error processing audio or transcription: {e}")
         try:
-            os.remove("google_credentials.json") #Try to remove it even if there is another error
+            os.remove("google_credentials.json") #Cleanup
         except FileNotFoundError:
             pass
-
-elif audio_bytes is None:
-    st.info("Please start recording audio.")
+elif audio_base64 is None:
+    st.info("Click 'Record 5 Seconds' to start recording.")
